@@ -1,0 +1,92 @@
+# Uptime probe for stagelink365.com.
+#
+# WHY THIS LIVES IN ITS OWN PUBLIC REPO. GitHub bills Actions minutes on
+# PRIVATE repositories and rounds every job up to a full minute, so a frequent
+# probe of a single URL is surprisingly expensive: run from the application's
+# own private repo, this workflow consumed essentially the whole monthly
+# allowance and left none for CI. On a PUBLIC repository, standard runners are
+# free and unlimited — and this probe needs nothing private to do its job. It
+# checks one public, deliberately-unauthenticated health endpoint and reads a
+# status code: no application source, no checkout, no credentials, no secrets.
+#
+# So the frequency dial below is free to turn. The only real cost of a shorter
+# interval is noise.
+name: Uptime
+
+on:
+  schedule:
+    # Every 6 hours while the site is pre-launch: enough to catch a sustained
+    # outage, quiet enough not to mail about blips nobody is there to notice.
+    #
+    # AT LAUNCH, CHANGE THIS TO "*/5 * * * *". It costs nothing here, and
+    # 5 minutes is the resolution this probe was designed for. Expect drift
+    # either way — GitHub's scheduler is late under load and drops runs.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+# A late run must never queue behind an earlier one; the newest answer is the
+# only one worth having.
+concurrency:
+  group: uptime
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe the health endpoint
+        env:
+          # A repo variable so a domain change needs no code edit. Not a secret:
+          # the endpoint is public and unauthenticated by design.
+          HEALTH_URL: ${{ vars.HEALTH_URL || 'https://stagelink365.com/api/health' }}
+        run: |
+          set -uo pipefail
+
+          # THREE ATTEMPTS, NOT ONE. The outages this exists to catch were brief
+          # and self-recovering, so a single-shot probe would go red on blips
+          # nobody needs waking for — and a noisy monitor gets muted. All three
+          # must fail before this goes red. A PARTIAL failure is still written to
+          # the run summary, so a blip stays visible without crying wolf.
+          ok=0
+          fail=0
+          notes=""
+          for attempt in 1 2 3; do
+            # --max-time bounds a hang: an unanswered request is an outage too.
+            code=$(curl -s -o /tmp/body -w "%{http_code}" --max-time 15 "$HEALTH_URL" || echo "000")
+            body=$(head -c 200 /tmp/body 2>/dev/null || true)
+            if [ "$code" = "200" ]; then
+              ok=$((ok + 1))
+              echo "attempt $attempt: 200 OK — $body"
+            else
+              fail=$((fail + 1))
+              echo "attempt $attempt: HTTP $code — $body"
+              notes="${notes}- attempt ${attempt}: HTTP ${code} \`${body}\`"$'\n'
+            fi
+            if [ "$attempt" -lt 3 ]; then sleep 20; fi
+          done
+
+          {
+            echo "### Uptime probe"
+            echo ""
+            echo "\`$HEALTH_URL\` — **${ok}/3 healthy**"
+            if [ -n "$notes" ]; then
+              echo ""
+              echo "$notes"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ok" -eq 0 ]; then
+            echo "::error::stagelink365.com is DOWN — 3 consecutive probes failed."
+            echo ""
+            echo "If every attempt returned 401/403 rather than 503, this is not an"
+            echo "outage: deployment protection is shielding the route, and the"
+            echo "monitor has been measuring the shield. Check that first."
+            exit 1
+          fi
+
+          if [ "$fail" -gt 0 ]; then
+            echo "::warning::Recovered after ${fail} failed probe(s) — a brief drop."
+          fi

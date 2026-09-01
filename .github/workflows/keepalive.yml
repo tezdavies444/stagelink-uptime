@@ -1,0 +1,43 @@
+# Keeps the uptime probe alive.
+#
+# ⚠️ THE TRAP THIS EXISTS TO AVOID. On a PUBLIC repository GitHub automatically
+# disables scheduled workflows after 60 days with no repository activity — and
+# a monitoring repo, by its nature, is never committed to. Left alone, the probe
+# would switch itself off after two months of doing its job perfectly, during
+# exactly the quiet stretch where nobody would notice it had stopped.
+#
+# One commit a month resets that timer. That is all this does.
+name: Keepalive
+
+on:
+  schedule:
+    # 06:12 on the 1st of each month. Odd minute on purpose: GitHub drops
+    # scheduled runs that land on the hour, when everyone else's crons fire.
+    - cron: "12 6 1 * *"
+  workflow_dispatch:
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+permissions:
+  # The one permission this repo grants anything: committing its own heartbeat.
+  contents: write
+
+jobs:
+  touch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Commit a heartbeat
+        run: |
+          set -euo pipefail
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          # --allow-empty so a same-second re-run still produces activity rather
+          # than failing the job on "nothing to commit".
+          git commit --allow-empty -m "chore: keepalive — stop GitHub disabling the scheduled probe"
+          git push
